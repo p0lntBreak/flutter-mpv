@@ -478,7 +478,7 @@ static FlMethodResponse *method_load(FlValue *args)
     }
 
     // Initialize render context AFTER loading file and resizing buffer
-    init_mpv_render_context(g_player);
+    //init_mpv_render_context(g_player);
 
     // After mpv_command(g_player->mpv, cmd);
     int found_video = 0;

@@ -16,6 +16,7 @@ class MyApp extends StatelessWidget {
         primarySwatch: Colors.blue,
       ),
       home: Scaffold(
+        backgroundColor: Colors.red,
         body: MpvEmbedWidget(
             //url: 'https://live-hls-web-aje.getaj.net/AJE/index.m3u8'),
             url: '/home/point_break/sample.mp4'),
