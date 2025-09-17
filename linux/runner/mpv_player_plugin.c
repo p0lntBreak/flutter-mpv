@@ -122,6 +122,10 @@ static MPVPlayer *g_player = NULL;
 
 // Forward declarations
 static gboolean try_render_frame(gpointer user_data);
+static void init_mpv_render_context(MPVPlayer *p);  // ADD THIS LINE
+static void handle_mpv_events(MPVPlayer *p);        // ADD THIS LINE
+
+
 
 // Render callback for mpv - just set a flag, don't render directly
 static void render_update_callback(void *cb_ctx)
@@ -231,6 +235,7 @@ static gboolean try_render_frame(gpointer user_data)
 }
 
 // Add this function to debug MPV state
+static void debug_mpv_state(MPVPlayer *p) __attribute__((unused));
 static void debug_mpv_state(MPVPlayer *p)
 {
     if (!p || !p->mpv) return;
@@ -255,36 +260,76 @@ static void debug_mpv_state(MPVPlayer *p)
     if (playback_abort) mpv_free(playback_abort);
 }
 
-// Timer callback for status monitoring
+// Timer callback for status monitoring (modofied)
+// FIRST: Define handle_mpv_events as a separate function OUTSIDE of any other function
+// Place this BEFORE status_timer_cb function
+static void handle_mpv_events(MPVPlayer *p) {
+    while (p->mpv) {
+        mpv_event *event = mpv_wait_event(p->mpv, 0);
+        if (event->event_id == MPV_EVENT_NONE)
+            break;
+            
+        switch (event->event_id) {
+            case MPV_EVENT_VIDEO_RECONFIG:
+                g_print("Video reconfigured - requesting render\n");
+                if (p->render_context_ready) {
+                    g_idle_add(try_render_frame, p);
+                }
+                break;
+                
+            case MPV_EVENT_PLAYBACK_RESTART:
+                g_print("Playback resumed - requesting render\n");
+                if (p->render_context_ready) {
+                    g_idle_add(try_render_frame, p);
+                }
+                break;
+                
+            case MPV_EVENT_FILE_LOADED:
+                g_print("File loaded successfully\n");
+                // Initialize render context after file is loaded
+                if (!p->render_context_ready) {
+                    init_mpv_render_context(p);
+                }
+                break;
+                
+            default:
+                break;
+        }
+    }
+}
+
+// SECOND: Now define the corrected status_timer_cb function
 static gboolean status_timer_cb(gpointer userdata)
 {
     MPVPlayer *p = (MPVPlayer *)userdata;
     if (!p || !p->initialized)
         return G_SOURCE_REMOVE;
 
+    // Handle MPV events (CALL the function, don't define it here)
+    handle_mpv_events(p);
+
     static int debug_counter = 0;
-    if (debug_counter++ % 30 == 0)
-    { // Every second at 30fps
+    debug_counter++;
+    
+    // Force a render attempt every few frames if we have a render context
+    if (p->render_context_ready && debug_counter % 10 == 0) {
+        g_idle_add(try_render_frame, p);
+    }
+
+    if (debug_counter % 30 == 0) { // Every second at 30fps
         int paused = 1;
         double time_pos = 0;
         char *filename = NULL;
 
-        if (mpv_get_property(p->mpv, "pause", MPV_FORMAT_FLAG, &paused) >= 0)
-        {
+        if (mpv_get_property(p->mpv, "pause", MPV_FORMAT_FLAG, &paused) >= 0) {
             mpv_get_property(p->mpv, "time-pos", MPV_FORMAT_DOUBLE, &time_pos);
             mpv_get_property(p->mpv, "filename", MPV_FORMAT_STRING, &filename);
 
             g_print("Status: paused=%d, time=%.2f, file=%s\n",
                     paused, time_pos, filename ? filename : "none");
 
-            if (filename)
-            {
+            if (filename) {
                 mpv_free(filename);
-            }
-            
-            // Add detailed debug every 5 seconds
-            if (debug_counter % 150 == 0) {
-                debug_mpv_state(p);
             }
         }
     }
@@ -306,7 +351,6 @@ static gboolean status_timer_cb(gpointer userdata)
     
     return G_SOURCE_CONTINUE;
 }
-
 // Initialize mpv render context - MOVED TO AFTER FILE LOADING
 static void init_mpv_render_context(MPVPlayer *p)
 {
@@ -315,12 +359,42 @@ static void init_mpv_render_context(MPVPlayer *p)
 
     g_print("=== Initializing mpv software render context ===\n");
 
-    // CRITICAL: Set vo to null for software rendering
+    // Wait for video to be ready
+    int64_t w = 0, h = 0;
+    int attempts = 0;
+    while (attempts < 50) {
+        if (mpv_get_property(p->mpv, "width", MPV_FORMAT_INT64, &w) >= 0 &&
+            mpv_get_property(p->mpv, "height", MPV_FORMAT_INT64, &h) >= 0 &&
+            w > 0 && h > 0) {
+            break;
+        }
+        g_usleep(50000); // 50ms
+        attempts++;
+    }
+    
+    if (w > 0 && h > 0) {
+        g_print("Video dimensions: %ld x %ld\n", w, h);
+        // Resize texture buffer to match video
+        if (w != p->frame_w || h != p->frame_h) {
+            g_mutex_lock(&p->texture->pixel_mutex);
+            g_free(p->texture->pixels);
+            p->texture->width = w;
+            p->texture->height = h;
+            p->frame_w = w;
+            p->frame_h = h;
+            size_t buffer_size = w * h * 4;
+            p->texture->pixels = g_malloc0(buffer_size);
+            g_mutex_unlock(&p->texture->pixel_mutex);
+            g_print("Resized texture buffer to %ld x %ld\n", w, h);
+        }
+    }
+
+    // Set vo to null for software rendering
     mpv_set_property_string(p->mpv, "vo", "null");
     mpv_set_property_string(p->mpv, "hwdec", "no");
-    mpv_set_property_string(g_player->mpv, "vd-lavc-dr", "no");
-    mpv_set_property_string(g_player->mpv, "keep-open", "yes");
-
+    mpv_set_property_string(p->mpv, "vd-lavc-dr", "no");
+    mpv_set_property_string(p->mpv, "keep-open", "yes");
+    
     int64_t track_count = 0;
     if (mpv_get_property(g_player->mpv, "track-list/count", MPV_FORMAT_INT64, &track_count) >= 0) {
         g_print("Track count: %ld\n", track_count);
@@ -335,14 +409,13 @@ static void init_mpv_render_context(MPVPlayer *p)
     }
 }  
     
-    // Create software mpv render context
+ // Create software mpv render context
     mpv_render_param params[] = {
         {MPV_RENDER_PARAM_API_TYPE, (void *)MPV_RENDER_API_TYPE_SW},
         {0}};
 
     int rc = mpv_render_context_create(&p->mpv_gl, p->mpv, params);
-    if (rc < 0)
-    {
+    if (rc < 0) {
         g_printerr("mpv_render_context_create failed: %d\n", rc);
         return;
     }
@@ -352,13 +425,15 @@ static void init_mpv_render_context(MPVPlayer *p)
 
     p->render_context_ready = TRUE;
     g_print("=== mpv software render context created successfully ===\n");
+    
+    // Force an initial render
+    g_idle_add(try_render_frame, p);
 }
 
 // Method handlers
 static FlMethodResponse *method_init(FlTextureRegistrar *registrar, FlView *view)
 {
-    if (g_player)
-    {
+    if (g_player) {
         return FL_METHOD_RESPONSE(fl_method_error_response_new("ALREADY", "already initialized", NULL));
     }
 
@@ -377,16 +452,11 @@ static FlMethodResponse *method_init(FlTextureRegistrar *registrar, FlView *view
     g_player->texture = mpv_pixel_texture_new(g_player->frame_w, g_player->frame_h);
     g_player->texture_id = fl_texture_registrar_register_texture(registrar, FL_TEXTURE(g_player->texture));
 
-    g_print("DEBUG: Texture registered with ID: %ld, texture object: %p\n",
-            (long)g_player->texture_id, g_player->texture);
-    g_print("DEBUG: Registrar: %p, FL_TEXTURE cast: %p\n",
-            registrar, FL_TEXTURE(g_player->texture));
-    fflush(stdout);
+    g_print("DEBUG: Texture registered with ID: %ld\n", (long)g_player->texture_id);
 
     // Create mpv instance
     g_player->mpv = mpv_create();
-    if (!g_player->mpv)
-    {
+    if (!g_player->mpv) {
         g_free(g_player);
         g_player = NULL;
         return FL_METHOD_RESPONSE(fl_method_error_response_new("MPV_CREATE", "mpv_create failed", NULL));
@@ -395,49 +465,41 @@ static FlMethodResponse *method_init(FlTextureRegistrar *registrar, FlView *view
     // Set mpv options BEFORE initialize
     mpv_set_option_string(g_player->mpv, "config", "yes");
     mpv_set_option_string(g_player->mpv, "input-default-bindings", "yes");
-    mpv_set_option_string(g_player->mpv, "force-window", "yes");
-    // CRITICAL: Don't set vo here - will be set in init_mpv_render_context
+    mpv_set_option_string(g_player->mpv, "force-window", "no");  // Changed to "no"
     mpv_set_option_string(g_player->mpv, "msg-level", "all=v");
+    
+    // Enable event observation
+    mpv_observe_property(g_player->mpv, 0, "video-reconfig", MPV_FORMAT_FLAG);
 
     // Initialize mpv
-    if (mpv_initialize(g_player->mpv) < 0)
-    {
+    if (mpv_initialize(g_player->mpv) < 0) {
         mpv_destroy(g_player->mpv);
         g_free(g_player);
         g_player = NULL;
         return FL_METHOD_RESPONSE(fl_method_error_response_new("MPV_INIT", "mpv_initialize failed", NULL));
     }
 
-    // DON'T initialize render context here - wait until after file load
-    // init_mpv_render_context(g_player);
-
     g_player->initialized = TRUE;
 
-    // Start status timer
-    g_player->timer_id = g_timeout_add(33, status_timer_cb, g_player);
+    // Start status timer at higher frequency
+    g_player->timer_id = g_timeout_add(33, status_timer_cb, g_player); // ~30fps
 
     g_print("=== mpv player initialized, texture_id: %" G_GINT64_FORMAT " ===\n", g_player->texture_id);
     return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_int(g_player->texture_id)));
 }
-
 static FlMethodResponse *method_load(FlValue *args)
 {
-    if (!g_player || !g_player->mpv)
-    {
+    if (!g_player || !g_player->mpv) {
         return FL_METHOD_RESPONSE(fl_method_error_response_new("NOT_INIT", "player not init", NULL));
     }
 
     FlValue *urlv = fl_value_lookup_string(args, "url");
-    if (!urlv)
-    {
+    if (!urlv) {
         return FL_METHOD_RESPONSE(fl_method_error_response_new("ARG", "missing url", NULL));
     }
 
     const char *url = fl_value_get_string(urlv);
     g_print("=== Loading URL: %s ===\n", url);
-
-    // Initialize render context BEFORE loading file
-   // init_mpv_render_context(g_player);
 
     // HLS-specific configuration
     if (strstr(url, ".m3u8") != NULL) {
@@ -450,65 +512,17 @@ static FlMethodResponse *method_load(FlValue *args)
     // Load file
     const char *cmd[] = {"loadfile", url, NULL};
     int rc = mpv_command(g_player->mpv, cmd);
-    if (rc < 0)
-    {
+    if (rc < 0) {
         g_printerr("mpv load failed: %d\n", rc);
         return FL_METHOD_RESPONSE(fl_method_error_response_new("LOAD", "mpv load failed", NULL));
     }
 
-    // Query video size and resize buffer if needed
-    int64_t w = 0, h = 0;
-    if (mpv_get_property(g_player->mpv, "width", MPV_FORMAT_INT64, &w) >= 0 &&
-        mpv_get_property(g_player->mpv, "height", MPV_FORMAT_INT64, &h) >= 0 &&
-        w > 0 && h > 0)
-    {
-        g_print("Video size: %ld x %ld\n", w, h);
-        if (w != g_player->frame_w || h != g_player->frame_h)
-        {
-            g_mutex_lock(&g_player->texture->pixel_mutex);
-            g_free(g_player->texture->pixels);
-            g_player->texture->width = w;
-            g_player->texture->height = h;
-            g_player->frame_w = w;
-            g_player->frame_h = h;
-            size_t buffer_size = w * h * 4;
-            g_player->texture->pixels = g_malloc0(buffer_size);
-            g_mutex_unlock(&g_player->texture->pixel_mutex);
-        }
-    }
-
-    // Initialize render context AFTER loading file and resizing buffer
-    //init_mpv_render_context(g_player);
-
-    // After mpv_command(g_player->mpv, cmd);
-    int found_video = 0;
-    for (int tries = 0; tries < 50 && !found_video; tries++) {
-        int64_t track_count = 0;
-        if (mpv_get_property(g_player->mpv, "track-list/count", MPV_FORMAT_INT64, &track_count) >= 0) {
-            for (int64_t i = 0; i < track_count; i++) {
-                mpv_node node;
-                char key[64];
-                snprintf(key, sizeof(key), "track-list/%ld/type", i);
-                if (mpv_get_property(g_player->mpv, key, MPV_FORMAT_STRING, &node) >= 0) {
-                    if (strcmp(node.u.string, "video") == 0) {
-                        found_video = 1;
-                    }
-                    mpv_free(node.u.string);
-                }
-            }
-        }
-        if (!found_video) g_usleep(100000); // sleep 100ms
-    }
-    if (found_video) {
-        init_mpv_render_context(g_player);
-    } else {
-        g_printerr("No video track found after loading file\n");
-    }
-
+    // DON'T initialize render context here - let the event handler do it
+    // when MPV_EVENT_FILE_LOADED is received
+    
     g_print("=== URL loaded successfully ===\n");
     return FL_METHOD_RESPONSE(fl_method_success_response_new(NULL));
 }
-
 static FlMethodResponse *method_play()
 {
     if (!g_player || !g_player->mpv)
